@@ -1,0 +1,70 @@
+# 🦀 FerroS3
+
+![FerroS3 Banner](assets/banner.png)
+
+**FerroS3** is a high-performance, minimalist S3-compatible proxy written in Rust. It serves local filesystem directories as S3 buckets, providing a lightweight alternative to MinIO for resource-constrained environments like old FreeBSD kernels or embedded Linux.
+
+---
+
+## 🚀 Features
+
+-   **High Performance**: Built on top of `Tokio` and `Axum` for asynchronous I/O.
+-   **Full AWS SigV4 Support**: Compatible with official AWS CLI, SDKs, and standard S3 clients.
+-   **Modular Architecture**: Clean, extensible code structure.
+-   **In-Memory Stat Cache**: Lightning-fast metadata retrieval using `DashMap`.
+-   **Advanced Listing**: Supports ListObjects v1/v2 with `prefix` and `delimiter`.
+-   **Streaming Support**: Handles large file uploads and downloads (Range Requests) efficiently.
+-   **Cross-Platform**: Designed to run seamlessly on Linux, macOS, and **FreeBSD**.
+-   **Zero External DB**: Pure filesystem-backed storage.
+
+## 📦 Installation
+
+### Pre-built Binaries
+Check the [Releases](https://github.com/mysamimi/ferros3/releases) page for pre-built binaries for Linux and FreeBSD.
+
+### Build from Source
+```bash
+git clone https://github.com/mysamimi/ferros3.git
+cd ferros3
+cargo build --release
+```
+
+## 🛠️ Configuration
+
+Create a `config.yaml` file:
+
+```yaml
+port: 8080
+endpoint: "0.0.0.0"
+verbose: true
+cache_size: 10000
+auth:
+  access_key: "YOUR_ACCESS_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+buckets:
+  - name: "my-bucket"
+    storage: "/path/to/local/data"
+```
+
+## 🏗️ Cross-Compilation (FreeBSD/Linux)
+
+To build for FreeBSD on a non-FreeBSD machine:
+
+1.  Install `cross`:
+    ```bash
+    cargo install cross --git https://github.com/cross-rs/cross.git
+    ```
+2.  Build for FreeBSD:
+    ```bash
+    make build-freebsd
+    ```
+
+## 🐳 Docker
+
+```bash
+docker build -t ferros3 .
+docker run -p 8080:8080 -v ./config.yaml:/app/config.yaml -v ./data:/data ferros3
+```
+
+## 📝 License
+This project is licensed under the MIT License.
