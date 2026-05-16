@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Configuration
+config.yaml
+
+# Test data
+/test_data
+/data
