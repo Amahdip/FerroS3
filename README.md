@@ -48,16 +48,26 @@ buckets:
 
 ## 🏗️ Cross-Compilation (FreeBSD/Linux)
 
-To build for FreeBSD on a non-FreeBSD machine:
+### Modern Targets (Linux & FreeBSD 12+)
+To cross-compile for modern FreeBSD or Linux from a macOS/Windows host:
 
 1.  Install `cross`:
     ```bash
     cargo install cross --git https://github.com/cross-rs/cross.git
     ```
-2.  Build for FreeBSD:
+2.  Build for your target:
     ```bash
+    # For FreeBSD 12+
     make build-freebsd
+    
+    # For Linux (x86_64)
+    make build-linux
     ```
+
+### Legacy Targets (FreeBSD 11.2)
+If you need to deploy FerroS3 to an older system (like FreeBSD 11.2 or older TrueNAS Core versions), standard cross-compilation will fail due to `libc` version mismatches. 
+
+We provide a dedicated Docker-based build pipeline and C shims to achieve this. Please see the [Legacy FreeBSD Build Guide](legacy-freebsd-build-osx.md) for detailed instructions.
 
 ## 🐳 Docker
 

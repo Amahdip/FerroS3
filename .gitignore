@@ -8,3 +8,4 @@ config.yaml
 # Test data
 /test_data
 /data
+/my-servers
