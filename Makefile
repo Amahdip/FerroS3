@@ -12,7 +12,7 @@ build-freebsd:
 	cross build --release --target x86_64-unknown-freebsd
 
 build-linux:
-	cross build --release --target x86_64-unknown-linux-gnu
+	cross build --release --target x86_64-unknown-linux-musl
 
 run:
 	cargo run
