@@ -1,15 +1,11 @@
-#include <sys/types.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <pthread_np.h>
+// FreeBSD 11.2 compatibility shim.
+//
+// pthread_setname_np: Added in FreeBSD 12.2 (POSIX name).
+// FreeBSD 11 only has pthread_set_name_np (without "thread" in the middle).
+// We provide this wrapper so the Rust binary can link against it when built
+// for legacy FreeBSD 11.x environments.
 
-ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    ssize_t ret = read(fd, buf, buflen);
-    close(fd);
-    return ret;
-}
+#include <pthread_np.h>
 
 void pthread_setname_np(pthread_t thread, const char *name) {
     pthread_set_name_np(thread, name);

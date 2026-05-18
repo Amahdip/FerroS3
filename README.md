@@ -67,7 +67,7 @@ To cross-compile for modern FreeBSD or Linux from a macOS/Windows host:
 ### Legacy Targets (FreeBSD 11.2)
 If you need to deploy FerroS3 to an older system (like FreeBSD 11.2 or older TrueNAS Core versions), standard cross-compilation will fail due to `libc` version mismatches. 
 
-We provide a dedicated Docker-based build pipeline and C shims to achieve this. Please see the [Legacy FreeBSD Build Guide](legacy-freebsd-build-osx.md) for detailed instructions.
+We provide a dedicated Docker-based build pipeline and a small FreeBSD 11 compatibility shim for this target. Please see the [Legacy FreeBSD Build Guide](legacy-freebsd-build-osx.md) for detailed instructions.
 
 ## 🐳 Docker
 
