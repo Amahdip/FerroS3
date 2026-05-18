@@ -26,6 +26,29 @@ pub enum S3ErrorType {
     // Add more as needed
 }
 
+/// Generate a random request ID without using the `uuid` crate.
+/// This reads 16 bytes from /dev/urandom (always available on FreeBSD and Linux)
+/// and formats them as a UUID v4-style string. This avoids the getrandom(2)
+/// syscall which is only available on FreeBSD 12+ and Linux 3.17+.
+fn new_request_id() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    // Format as UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
+    buf[8] = (buf[8] & 0x3f) | 0x80; // variant bits
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        buf[0], buf[1], buf[2], buf[3],
+        buf[4], buf[5],
+        buf[6], buf[7],
+        buf[8], buf[9],
+        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
+    )
+}
+
 impl S3ErrorType {
     pub fn to_response(&self, resource: Option<String>) -> Response {
         let (status, code, message) = match self {
@@ -55,7 +78,7 @@ impl S3ErrorType {
             code: code.to_string(),
             message: message.to_string(),
             resource,
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: new_request_id(),
         };
 
         let xml = to_string(&err).unwrap_or_default();
