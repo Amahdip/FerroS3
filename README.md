@@ -31,7 +31,13 @@ cargo build --release
 
 ## 🛠️ Configuration
 
-Create a `config.yaml` file:
+Copy `config.yaml.example` to `config.yaml` and adjust the values:
+
+```bash
+cp config.yaml.example config.yaml
+```
+
+Example configuration:
 
 ```yaml
 port: 8080
