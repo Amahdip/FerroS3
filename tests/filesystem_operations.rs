@@ -102,6 +102,25 @@ impl TestServer {
             == StatusCode::OK
     }
 
+    async fn head_etag(&self, key: &str) -> String {
+        let response = self
+            .client
+            .head(self.object_url(key))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_string()
+    }
+
     async fn list(&self, prefix: &str, delimiter: Option<&str>) -> String {
         let mut request = self
             .client
@@ -127,7 +146,7 @@ impl TestServer {
                 > 1
     }
 
-    async fn md5(&self, key: &str) -> String {
+    async fn content_md5(&self, key: &str) -> String {
         let mut hasher = Md5::new();
         hasher.update(self.read(key).await);
         format!("{:x}", hasher.finalize())
@@ -223,8 +242,9 @@ async fn filesystem_operations_work_end_to_end() {
     assert!(listing.contains("<Key>docs/source.txt</Key>"));
     assert!(listing.contains("<Prefix>docs/archive/</Prefix>"));
 
-    let checksum = server.md5("docs/source.txt").await;
-    assert_eq!(checksum, "1922cd4fcab920a5f64e3426a834deba");
+    let checksum = server.content_md5("docs/source.txt").await;
+    let expected_checksum = format!("{:x}", Md5::digest(b"hello ferros3"));
+    assert_eq!(checksum, expected_checksum);
 
     server.copy("docs/source.txt", "docs/copied.txt").await;
     assert_eq!(server.read("docs/copied.txt").await, b"hello ferros3");
@@ -247,4 +267,22 @@ async fn filesystem_operations_work_end_to_end() {
 
     assert!(!server.exists("docs/renamed.txt").await);
     assert!(!server.directory_exists("docs/archive/").await);
+}
+
+#[tokio::test]
+async fn md5_is_computed_from_object_body_not_etag() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("payload.bin");
+    let source_bytes = b"md5 regression payload";
+
+    fs::write(&source_file, source_bytes).await.unwrap();
+    server.write("checksums/payload.bin", &source_file).await;
+
+    let expected_md5 = format!("{:x}", Md5::digest(source_bytes));
+    let actual_md5 = server.content_md5("checksums/payload.bin").await;
+    let actual_etag = server.head_etag("checksums/payload.bin").await;
+
+    assert_eq!(actual_md5, expected_md5);
+    assert_ne!(actual_etag, expected_md5);
+    assert!(actual_etag.contains('-'));
 }
