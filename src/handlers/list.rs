@@ -173,3 +173,123 @@ pub async fn list_objects(
         .body(Body::from(xml))
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::collections::HashMap;
+    use dashmap::DashMap;
+    use tokio::fs;
+    use axum::body::to_bytes;
+    use crate::config::{Config, BucketConfig};
+
+    async fn setup_test_state(bucket_name: &str, storage_path: &str) -> Arc<AppState> {
+        let mut storage_map = HashMap::new();
+        storage_map.insert(bucket_name.to_string(), PathBuf::from(storage_path));
+        
+        let config = Config {
+            port: 8080,
+            endpoint: "0.0.0.0".to_string(),
+            verbose: false,
+            cache_size: 10,
+            auth: None,
+            buckets: vec![BucketConfig { name: bucket_name.to_string(), storage: storage_path.to_string() }],
+        };
+
+        Arc::new(AppState {
+            config,
+            cache: DashMap::new(),
+            storage_map,
+        })
+    }
+
+    async fn create_test_files(base: &str, files: &[&str]) {
+        for f in files {
+            let path = PathBuf::from(base).join(f);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await.unwrap();
+            }
+            fs::write(&path, "data").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_truncation_and_keycount() {
+        let storage = "./test_list_data";
+        let bucket = "test_bucket";
+        let _ = fs::remove_dir_all(storage).await;
+        fs::create_dir_all(storage).await.unwrap();
+
+        create_test_files(storage, &["a.txt", "b.txt", "c.txt"]).await;
+
+        let state = setup_test_state(bucket, storage).await;
+
+        // Test max_keys = 2 (Should be truncated)
+        let params = ListObjectsParams {
+            prefix: None,
+            delimiter: None,
+            marker: None,
+            max_keys: Some(2),
+            list_type: Some(2),
+            continuation_token: None,
+        };
+        let response = list_objects(Path(bucket.to_string()), Query(params), State(state.clone())).await;
+        let (_, body) = response.into_parts();
+        let xml = String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap();
+
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<KeyCount>2</KeyCount>"));
+
+        // Test max_keys = 3 (Exactly matching total files, Should NOT be truncated)
+        let params_exact = ListObjectsParams {
+            prefix: None,
+            delimiter: None,
+            marker: None,
+            max_keys: Some(3),
+            list_type: Some(2),
+            continuation_token: None,
+        };
+        let response_exact = list_objects(Path(bucket.to_string()), Query(params_exact), State(state.clone())).await;
+        let (_, body_exact) = response_exact.into_parts();
+        let xml_exact = String::from_utf8(to_bytes(body_exact, usize::MAX).await.unwrap().to_vec()).unwrap();
+
+        assert!(xml_exact.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(xml_exact.contains("<KeyCount>3</KeyCount>"));
+
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_delimiter() {
+        let storage = "./test_list_data_delim";
+        let bucket = "test_bucket";
+        let _ = fs::remove_dir_all(storage).await;
+        fs::create_dir_all(storage).await.unwrap();
+
+        create_test_files(storage, &["folder1/a.txt", "folder1/b.txt", "folder2/c.txt", "root.txt"]).await;
+
+        let state = setup_test_state(bucket, storage).await;
+
+        let params = ListObjectsParams {
+            prefix: None,
+            delimiter: Some("/".to_string()),
+            marker: None,
+            max_keys: Some(10),
+            list_type: Some(2),
+            continuation_token: None,
+        };
+        
+        let response = list_objects(Path(bucket.to_string()), Query(params), State(state.clone())).await;
+        let (_, body) = response.into_parts();
+        let xml = String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap();
+
+        assert!(xml.contains("<Key>root.txt</Key>"));
+        assert!(xml.contains("<Prefix>folder1/</Prefix>"));
+        assert!(xml.contains("<Prefix>folder2/</Prefix>"));
+        assert!(xml.contains("<KeyCount>3</KeyCount>"));
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+
+        let _ = fs::remove_dir_all(storage).await;
+    }
+}
