@@ -191,6 +191,7 @@ pub async fn head_object(
 
 pub async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
+    uri: OriginalUri,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Body,
@@ -204,6 +205,14 @@ pub async fn put_object(
         Some(s) => s,
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
+
+    // A PUT carrying the `?acl` subresource is PutObjectAcl — an ACL write, not an
+    // object write. We don't persist ACLs, but we must not fall through to the
+    // object-write path below, which would `File::create` (truncate) the object and
+    // overwrite its body with the ACL payload. Acknowledge it as a no-op.
+    if has_acl_query(uri.0.query()) {
+        return StatusCode::OK.into_response();
+    }
 
     let path = storage.join(key.trim_start_matches('/'));
 

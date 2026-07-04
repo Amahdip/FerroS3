@@ -318,3 +318,26 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
     server.copy("copy/source.txt", "copy/target.txt").await;
     assert_eq!(server.read("copy/target.txt").await, b"copy me");
 }
+
+#[tokio::test]
+async fn put_object_acl_does_not_truncate_the_object() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("acl.txt");
+    fs::write(&source_file, b"acl must not clobber this").await.unwrap();
+    server.write("acl/object.txt", &source_file).await;
+
+    // A PutObjectAcl request (PUT key?acl) must be a no-op on the object body, not
+    // overwrite it with the ACL payload.
+    let response = server
+        .client
+        .put(format!("{}?acl", server.object_url("acl/object.txt")))
+        .header("Authorization", &server.auth_header)
+        .body("<AccessControlPolicy><Owner></Owner></AccessControlPolicy>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The object body is unchanged.
+    assert_eq!(server.read("acl/object.txt").await, b"acl must not clobber this");
+}
