@@ -318,3 +318,58 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
     server.copy("copy/source.txt", "copy/target.txt").await;
     assert_eq!(server.read("copy/target.txt").await, b"copy me");
 }
+
+#[tokio::test]
+async fn copy_object_onto_itself_is_rejected_and_preserves_content() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("self.txt");
+    fs::write(&source_file, b"do not lose me").await.unwrap();
+    server.write("self/object.txt", &source_file).await;
+
+    // Copying an object onto itself must be rejected with 400, not silently truncate
+    // the object to 0 bytes (which is what a bare fs::copy would do).
+    let response = server
+        .client
+        .put(server.object_url("self/object.txt"))
+        .header("Authorization", &server.auth_header)
+        .header(
+            "x-amz-copy-source",
+            format!("/{}/{}", server.bucket, "self/object.txt"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The object must still hold its original bytes.
+    assert_eq!(server.read("self/object.txt").await, b"do not lose me");
+}
+
+#[tokio::test]
+async fn copy_object_result_etag_matches_destination_head() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("etag.txt");
+    fs::write(&source_file, b"etag consistency").await.unwrap();
+    server.write("etag/source.txt", &source_file).await;
+
+    let response = server
+        .client
+        .put(server.object_url("etag/dest.txt"))
+        .header("Authorization", &server.auth_header)
+        .header(
+            "x-amz-copy-source",
+            format!("/{}/{}", server.bucket, "etag/source.txt"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.text().await.unwrap();
+    let start = body.find("<ETag>").unwrap() + "<ETag>".len();
+    let end = body[start..].find("</ETag>").unwrap() + start;
+    let result_etag = body[start..end].trim_matches('"').to_string();
+
+    // The ETag returned by CopyObject must match a subsequent HEAD of the new object.
+    assert_eq!(result_etag, server.head_etag("etag/dest.txt").await);
+}

@@ -262,11 +262,24 @@ async fn copy_object(
     };
 
     let source_path = source_storage.join(source_key.trim_start_matches('/'));
-    let source_metadata = match fs::metadata(&source_path).await {
-        Ok(metadata) if !metadata.is_dir() => metadata,
+    match fs::metadata(&source_path).await {
+        Ok(metadata) if !metadata.is_dir() => {}
         Ok(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
     };
+
+    // Reject a copy of an object onto itself. `fs::copy` opens the destination with
+    // O_TRUNC before reading the source, so when both paths resolve to the same inode
+    // the object is truncated to 0 bytes. S3 rejects self-copies (unless metadata is
+    // being changed, which we don't support) rather than performing them.
+    if let (Ok(src_canon), Ok(dst_canon)) = (
+        fs::canonicalize(&source_path).await,
+        fs::canonicalize(destination_path).await,
+    ) {
+        if src_canon == dst_canon {
+            return S3ErrorType::InvalidRequest.to_response(Some(destination_key.to_string()));
+        }
+    }
 
     if let Some(parent) = destination_path.parent() {
         if let Err(_) = fs::create_dir_all(parent).await {
@@ -282,14 +295,21 @@ async fn copy_object(
         .cache
         .remove(&format!("{}/{}", destination_bucket, destination_key));
 
-    let mod_time: DateTime<Utc> = source_metadata
+    // Build the result from the destination's own metadata so the returned ETag/
+    // LastModified match a subsequent HEAD/GET of the copied object (the source's
+    // pre-copy mtime would not).
+    let dest_metadata = match fs::metadata(destination_path).await {
+        Ok(metadata) => metadata,
+        Err(_) => return S3ErrorType::InternalError.to_response(None),
+    };
+    let mod_time: DateTime<Utc> = dest_metadata
         .modified()
         .unwrap_or(SystemTime::now())
         .into();
     let etag = format!(
         "\"{:x}-{:x}\"",
         mod_time.timestamp_nanos_opt().unwrap_or(0),
-        source_metadata.len()
+        dest_metadata.len()
     );
     let result = CopyObjectResult {
         last_modified: mod_time.to_rfc3339(),
