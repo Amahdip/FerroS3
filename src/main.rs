@@ -3,18 +3,35 @@ use ferros3::{build_app, build_state, load_config};
 #[cfg(target_os = "freebsd")]
 use axum::body::{to_bytes, Body};
 #[cfg(target_os = "freebsd")]
-use axum::Router;
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 #[cfg(target_os = "freebsd")]
 use axum::response::IntoResponse;
 #[cfg(target_os = "freebsd")]
-use http::{HeaderName, HeaderValue, Method, Request, StatusCode};
+use axum::Router;
+#[cfg(target_os = "freebsd")]
+use ferros3::blocking_http::{
+    body_plan, format_response_head, parse_request_head, read_body, wants_100_continue,
+    MAX_BODY_BYTES,
+};
 #[cfg(target_os = "freebsd")]
 use std::{
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufReader, Write},
     net::TcpStream as StdTcpStream,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 #[cfg(target_os = "freebsd")]
 use tower::ServiceExt;
+
+/// Cap on concurrent connection threads, so a flood can't spawn unbounded OS threads
+/// (a pre-auth resource-exhaustion vector).
+#[cfg(target_os = "freebsd")]
+const MAX_CONNECTIONS: usize = 512;
+
+/// Upper bound on a buffered response body. The blocking shim buffers the whole response;
+/// this prevents an unbounded allocation (the old `to_bytes(body, usize::MAX)`). Fully
+/// streaming the body without buffering remains a follow-up.
+#[cfg(target_os = "freebsd")]
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 #[cfg(not(target_os = "freebsd"))]
 #[tokio::main]
@@ -46,6 +63,7 @@ async fn main() {
     println!("Rust S3 Proxy listening on http://{}", addr);
 
     let runtime_handle = tokio::runtime::Handle::current();
+    static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
     loop {
         let (stream, peer) = match listener.accept() {
@@ -56,12 +74,20 @@ async fn main() {
             }
         };
 
+        // Shed load past the connection cap instead of spawning threads without bound.
+        if ACTIVE_CONNECTIONS.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
+        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+
         let app = app.clone();
         let handle = runtime_handle.clone();
         std::thread::spawn(move || {
             if let Err(e) = serve_blocking_connection(stream, peer, app, handle) {
                 eprintln!("Connection error: {:?}", e);
             }
+            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -75,82 +101,55 @@ fn serve_blocking_connection(
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
     let (request, method) = read_http_request(&mut stream)?;
+    let head_only = method == Method::HEAD;
 
-    let (status, headers, body_bytes) = handle.block_on(async move {
+    handle.block_on(async move {
         let response = app
             .oneshot(request)
             .await
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         let (parts, body) = response.into_parts();
-        let body_bytes = to_bytes(body, usize::MAX).await.unwrap_or_default();
-        (parts.status, parts.headers, body_bytes)
-    });
 
-    write_http_response(&mut stream, status, headers, body_bytes, method == Method::HEAD)
+        // Buffer the body under a hard cap. A mid-stream read error now becomes a clean
+        // 500 rather than a bogus empty 200 (the old to_bytes(usize::MAX).unwrap_or_default()).
+        match to_bytes(body, MAX_RESPONSE_BYTES).await {
+            Ok(body_bytes) => {
+                write_http_response(&mut stream, parts.status, &parts.headers, body_bytes, head_only)
+            }
+            Err(_) => write_http_response(
+                &mut stream,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &HeaderMap::new(),
+                bytes::Bytes::new(),
+                head_only,
+            ),
+        }
+    })
 }
 
 #[cfg(target_os = "freebsd")]
 fn read_http_request(stream: &mut StdTcpStream) -> io::Result<(Request<Body>, Method)> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    if request_line.trim().is_empty() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty request"));
+    // Request line + headers (parsed by the host-tested `blocking_http` module).
+    let head = parse_request_head(&mut reader)?;
+
+    // Honor `Expect: 100-continue` before reading the body, or standard clients stall
+    // waiting for the interim response.
+    if wants_100_continue(&head.headers) {
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        stream.flush()?;
     }
 
-    let mut parts = request_line.trim_end_matches(['\r', '\n']).split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing method"))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing target"))?;
+    // Read the body per its framing (Content-Length or chunked), bounded so a huge
+    // declared length can't pre-allocate gigabytes.
+    let body = read_body(&mut reader, body_plan(&head.headers), MAX_BODY_BYTES)?;
 
-    let method = Method::from_bytes(method.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid method"))?;
-
-    let mut headers = axum::http::HeaderMap::new();
-    let mut content_length = 0usize;
-
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed header"))?;
-
-        let header_name = HeaderName::from_bytes(name.trim().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid header name"))?;
-        let header_value = HeaderValue::from_str(value.trim())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid header value"))?;
-
-        if header_name == http::header::CONTENT_LENGTH {
-            content_length = header_value
-                .to_str()
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-        }
-
-        headers.append(header_name, header_value);
-    }
-
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
-
-    let mut builder = Request::builder().method(method.clone()).uri(target);
+    let method = head.method.clone();
+    let mut builder = Request::builder().method(head.method).uri(head.target);
     if let Some(headers_mut) = builder.headers_mut() {
-        *headers_mut = headers;
+        *headers_mut = head.headers;
     }
-
     let request = builder
         .body(Body::from(body))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to build request"))?;
@@ -162,30 +161,14 @@ fn read_http_request(stream: &mut StdTcpStream) -> io::Result<(Request<Body>, Me
 fn write_http_response(
     stream: &mut StdTcpStream,
     status: StatusCode,
-    headers: axum::http::HeaderMap,
+    headers: &HeaderMap,
     body_bytes: bytes::Bytes,
     head_only: bool,
 ) -> io::Result<()> {
-    let reason = status.canonical_reason().unwrap_or("");
-
-    let mut response_head = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason);
-    response_head.push_str("Connection: close\r\n");
-    response_head.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
-
-    for (name, value) in headers.iter() {
-        if name == http::header::CONTENT_LENGTH || name == http::header::CONNECTION {
-            continue;
-        }
-        if let Ok(value_str) = value.to_str() {
-            response_head.push_str(name.as_str());
-            response_head.push_str(": ");
-            response_head.push_str(value_str);
-            response_head.push_str("\r\n");
-        }
-    }
-
-    response_head.push_str("\r\n");
-    stream.write_all(response_head.as_bytes())?;
+    // format_response_head (host-tested) preserves the handler's Content-Length for HEAD
+    // instead of overwriting it with the empty body length.
+    let head = format_response_head(status, headers, body_bytes.len(), head_only);
+    stream.write_all(head.as_bytes())?;
     if !head_only {
         stream.write_all(&body_bytes)?;
     }
