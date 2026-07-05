@@ -318,3 +318,39 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
     server.copy("copy/source.txt", "copy/target.txt").await;
     assert_eq!(server.read("copy/target.txt").await, b"copy me");
 }
+
+#[tokio::test]
+async fn bucket_routes_work_without_trailing_slash() {
+    let server = TestServer::start().await;
+
+    // ListObjects on the bare bucket path (the aws-cli/boto3 default) must not 404.
+    let list = server
+        .client
+        .get(format!("{}/{}", server.base_url, server.bucket))
+        .header("Authorization", &server.auth_header)
+        .query(&[("list-type", "2")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+
+    // HeadBucket on the bare bucket path.
+    let head = server
+        .client
+        .head(format!("{}/{}", server.base_url, server.bucket))
+        .header("Authorization", &server.auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+
+    // A missing bucket still returns 404.
+    let missing = server
+        .client
+        .head(format!("{}/no-such-bucket", server.base_url))
+        .header("Authorization", &server.auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}

@@ -44,6 +44,9 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(list_buckets))
         .route("/_admin/presign", axum::routing::post(generate_presigned_url))
+        // S3 path-style clients address a bucket as `/bucket` (no trailing slash);
+        // register both spellings so ListObjects/HeadBucket don't 404.
+        .route("/:bucket", get(list_objects).head(head_bucket))
         .route("/:bucket/", get(list_objects).head(head_bucket))
         .route(
             "/:bucket/*key",
