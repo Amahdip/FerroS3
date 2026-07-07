@@ -344,6 +344,40 @@ async fn malformed_sigv4_date_is_rejected_not_panicking() {
     let ok = server
         .client
         .head(format!("{}/{}/", server.base_url, server.bucket))
+async fn list_buckets_nests_bucket_elements() {
+    let server = TestServer::start().await;
+    let response = server
+        .client
+        .get(format!("{}/", server.base_url))
+        .header("Authorization", &server.auth_header)
+async fn bucket_routes_work_without_trailing_slash() {
+    let server = TestServer::start().await;
+
+    // ListObjects on the bare bucket path (the aws-cli/boto3 default) must not 404.
+    let list = server
+        .client
+        .get(format!("{}/{}", server.base_url, server.bucket))
+        .header("Authorization", &server.auth_header)
+        .query(&[("list-type", "2")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+
+    // HeadBucket on the bare bucket path.
+    let head = server
+        .client
+        .head(format!("{}/{}", server.base_url, server.bucket))
+        .header("Authorization", &server.auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+
+    // A missing bucket still returns 404.
+    let missing = server
+        .client
+        .head(format!("{}/no-such-bucket", server.base_url))
         .header("Authorization", &server.auth_header)
         .send()
         .await
@@ -390,6 +424,13 @@ async fn put_object_returns_matching_etag_and_leaves_no_temp_files() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let xml = response.text().await.unwrap();
+
+    // S3 SDKs parse ListBuckets as <Buckets><Bucket><Name>…</Name></Bucket></Buckets>;
+    // without the <Bucket> wrapper they see zero buckets.
+    assert!(xml.contains("<Buckets><Bucket>"), "missing <Bucket> wrapper: {xml}");
+    assert!(xml.contains("<Name>test-bucket</Name>"), "missing bucket name: {xml}");
+    assert!(xml.contains("</Bucket></Buckets>"), "missing closing wrappers: {xml}");
 
     // PutObject must return an ETag, and it must match a subsequent HEAD.
     let put_etag = response
