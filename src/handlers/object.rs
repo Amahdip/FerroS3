@@ -85,7 +85,10 @@ pub async fn get_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
-    let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
     let mut file = match File::open(&path).await {
         Ok(f) => f,
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(key)),
@@ -161,7 +164,10 @@ pub async fn head_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
-    let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
     let metadata = match fs::metadata(&path).await {
         Ok(m) => m,
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(key)),
@@ -191,6 +197,7 @@ pub async fn head_object(
 
 pub async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
+    uri: OriginalUri,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Body,
@@ -205,7 +212,19 @@ pub async fn put_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
+    // A PUT carrying the `?acl` subresource is PutObjectAcl — an ACL write, not an
+    // object write. We don't persist ACLs, but we must not fall through to the
+    // object-write path below, which would `File::create` (truncate) the object and
+    // overwrite its body with the ACL payload. Acknowledge it as a no-op.
+    if has_acl_query(uri.0.query()) {
+        return StatusCode::OK.into_response();
+    }
+
     let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
 
     if let Some(copy_source) = headers
         .get("x-amz-copy-source")
@@ -316,12 +335,28 @@ async fn copy_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(source_bucket)),
     };
 
-    let source_path = source_storage.join(source_key.trim_start_matches('/'));
-    let source_metadata = match fs::metadata(&source_path).await {
-        Ok(metadata) if !metadata.is_dir() => metadata,
+    let source_path = match safe_join(source_storage, &source_key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(source_key)),
+    };
+    match fs::metadata(&source_path).await {
+        Ok(metadata) if !metadata.is_dir() => {}
         Ok(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
     };
+
+    // Reject a copy of an object onto itself. `fs::copy` opens the destination with
+    // O_TRUNC before reading the source, so when both paths resolve to the same inode
+    // the object is truncated to 0 bytes. S3 rejects self-copies (unless metadata is
+    // being changed, which we don't support) rather than performing them.
+    if let (Ok(src_canon), Ok(dst_canon)) = (
+        fs::canonicalize(&source_path).await,
+        fs::canonicalize(destination_path).await,
+    ) {
+        if src_canon == dst_canon {
+            return S3ErrorType::InvalidRequest.to_response(Some(destination_key.to_string()));
+        }
+    }
 
     if let Some(parent) = destination_path.parent() {
         if let Err(_) = fs::create_dir_all(parent).await {
@@ -337,14 +372,21 @@ async fn copy_object(
         .cache
         .remove(&format!("{}/{}", destination_bucket, destination_key));
 
-    let mod_time: DateTime<Utc> = source_metadata
+    // Build the result from the destination's own metadata so the returned ETag/
+    // LastModified match a subsequent HEAD/GET of the copied object (the source's
+    // pre-copy mtime would not).
+    let dest_metadata = match fs::metadata(destination_path).await {
+        Ok(metadata) => metadata,
+        Err(_) => return S3ErrorType::InternalError.to_response(None),
+    };
+    let mod_time: DateTime<Utc> = dest_metadata
         .modified()
         .unwrap_or(SystemTime::now())
         .into();
     let etag = format!(
         "\"{:x}-{:x}\"",
         mod_time.timestamp_nanos_opt().unwrap_or(0),
-        source_metadata.len()
+        dest_metadata.len()
     );
     let result = CopyObjectResult {
         last_modified: mod_time.to_rfc3339(),
@@ -373,7 +415,10 @@ pub async fn delete_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
-    let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
     if let Err(_) = fs::remove_file(&path).await {
         // S3 returns 204 even if file doesn't exist during DELETE
         return StatusCode::NO_CONTENT.into_response();
@@ -445,4 +490,53 @@ fn parse_copy_source(copy_source: &str) -> Option<(String, String)> {
 
 fn owner_id() -> String {
     "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a".to_string()
+}
+
+fn safe_join(storage: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut resolved = storage.to_path_buf();
+    for component in std::path::Path::new(key).components() {
+        match component {
+            Component::Normal(c) => resolved.push(c),
+            Component::RootDir | Component::CurDir => continue,
+            Component::Prefix(_) | Component::ParentDir => return None,
+        }
+    }
+    Some(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_safe_join() {
+        let storage = Path::new("/var/data");
+
+        // Normal keys
+        assert_eq!(safe_join(storage, "my_file.txt").unwrap(), Path::new("/var/data/my_file.txt"));
+        assert_eq!(safe_join(storage, "folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Leading slashes are ignored (RootDir)
+        assert_eq!(safe_join(storage, "/folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Current dir dots are ignored
+        assert_eq!(safe_join(storage, "./folder/./file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // ParentDir traversal is rejected
+        assert!(safe_join(storage, "../etc/passwd").is_none());
+        assert!(safe_join(storage, "folder/../../etc/passwd").is_none());
+
+        // Windows drive prefixes are only parsed as `Prefix` components on Windows,
+        // where they are rejected. On Unix a string like "C:/..." is just a normal
+        // (contained) key, so it resolves safely inside storage instead.
+        #[cfg(windows)]
+        assert!(safe_join(storage, "C:/Windows/System32").is_none());
+        #[cfg(not(windows))]
+        assert_eq!(
+            safe_join(storage, "C:/Windows/System32").unwrap(),
+            Path::new("/var/data/C:/Windows/System32")
+        );
+    }
 }
