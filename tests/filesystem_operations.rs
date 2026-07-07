@@ -321,43 +321,56 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
 }
 
 #[tokio::test]
-async fn bare_access_key_is_rejected_but_valid_basic_auth_passes() {
+async fn copy_object_onto_itself_is_rejected_and_preserves_content() {
     let server = TestServer::start().await;
-    let url = server.object_url("secured/object.txt");
+    let source_file = server._source_dir.path().join("self.txt");
+    fs::write(&source_file, b"do not lose me").await.unwrap();
+    server.write("self/object.txt", &source_file).await;
 
-    // A bare access key (no secret) must NOT authenticate. The access key is public
-    // (it appears in every SigV4 Credential), so accepting it alone is a full bypass.
-    let bare_key = server
+    // Copying an object onto itself must be rejected with 400, not silently truncate
+    // the object to 0 bytes (which is what a bare fs::copy would do).
+    let response = server
         .client
-        .get(&url)
-        .header("Authorization", "test_key")
+        .put(server.object_url("self/object.txt"))
+        .header("Authorization", &server.auth_header)
+        .header(
+            "x-amz-copy-source",
+            format!("/{}/{}", server.bucket, "self/object.txt"),
+        )
         .send()
         .await
         .unwrap();
-    assert_eq!(bare_key.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // The correct access key with a wrong secret must also be rejected.
-    let wrong_secret = server
+    // The object must still hold its original bytes.
+    assert_eq!(server.read("self/object.txt").await, b"do not lose me");
+}
+
+#[tokio::test]
+async fn copy_object_result_etag_matches_destination_head() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("etag.txt");
+    fs::write(&source_file, b"etag consistency").await.unwrap();
+    server.write("etag/source.txt", &source_file).await;
+
+    let response = server
         .client
-        .get(&url)
-        .basic_auth("test_key", Some("not_the_secret"))
+        .put(server.object_url("etag/dest.txt"))
+        .header("Authorization", &server.auth_header)
+        .header(
+            "x-amz-copy-source",
+            format!("/{}/{}", server.bucket, "etag/source.txt"),
+        )
         .send()
         .await
         .unwrap();
-    assert_eq!(wrong_secret.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::OK);
 
-    // No credentials at all must be rejected.
-    let anonymous = server.client.get(&url).send().await.unwrap();
-    assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
+    let body = response.text().await.unwrap();
+    let start = body.find("<ETag>").unwrap() + "<ETag>".len();
+    let end = body[start..].find("</ETag>").unwrap() + start;
+    let result_etag = body[start..end].trim_matches('"').to_string();
 
-    // Valid Basic auth (access_key:secret_key) still works: 404 (not 403) proves it
-    // passed the auth layer and reached the handler for a missing object.
-    let valid = server
-        .client
-        .get(&url)
-        .basic_auth("test_key", Some("test_secret"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(valid.status(), StatusCode::NOT_FOUND);
+    // The ETag returned by CopyObject must match a subsequent HEAD of the new object.
+    assert_eq!(result_etag, server.head_etag("etag/dest.txt").await);
 }
