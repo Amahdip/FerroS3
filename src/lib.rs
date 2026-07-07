@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod blocking_http;
 pub mod cache;
 pub mod config;
 pub mod error;
