@@ -51,7 +51,8 @@ impl TestServer {
             _source_dir: source_dir,
             bucket,
             base_url: format!("http://{}", address),
-            auth_header: "test_key".to_string(),
+            // Basic base64("test_key:test_secret")
+            auth_header: "Basic dGVzdF9rZXk6dGVzdF9zZWNyZXQ=".to_string(),
             client: Client::new(),
             handle,
         }
